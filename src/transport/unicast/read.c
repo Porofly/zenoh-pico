@@ -362,6 +362,10 @@ void *_zp_unicast_read_task(void *ztu_arg) {
             size_t to_read = 0;
             // Retrieve data
             if (!_z_unicast_client_read(ztu, curr_peer, &to_read)) {
+                // Once the router closes the link, recv() returns at once without data (EOF/reset).
+                // Without a pause this loop spins and, under a FIFO scheduler, starves every task of
+                // the same priority, including the lease task that must detect the failure and reconnect.
+                z_sleep_ms(1);
                 continue;
             }
             // Process data

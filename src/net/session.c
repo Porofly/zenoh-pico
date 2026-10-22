@@ -218,14 +218,11 @@ z_result_t _z_reopen(_z_session_rc_t *zn) {
     do {
         ret = _z_open(zn, &zs->_config, &zs->_local_zid);
         if (ret != _Z_RES_OK) {
-            if (ret == _Z_ERR_TRANSPORT_OPEN_FAILED || ret == _Z_ERR_SCOUT_NO_RESULTS ||
-                ret == _Z_ERR_TRANSPORT_TX_FAILED || ret == _Z_ERR_TRANSPORT_RX_FAILED) {
-                _Z_DEBUG("Reopen failed, next try in 1s");
-                z_sleep_s(1);
-                continue;
-            } else {
-                return ret;
-            }
+            // Every failure is retried: a router that is restarting or still closing our previous
+            // transport refuses the session for a while (e.g. it answers the handshake with a Close)
+            _Z_DEBUG("Reopen failed: %i, next try in 1s", ret);
+            z_sleep_s(1);
+            continue;
         }
 
 #if Z_FEATURE_MULTI_THREAD == 1

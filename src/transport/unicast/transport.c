@@ -200,9 +200,15 @@ static z_result_t _z_unicast_handshake_open(_z_transport_unicast_establish_param
     _z_transport_message_t oam = {0};
     _Z_RETURN_IF_ERR(_z_link_recv_t_msg(&oam, zl, socket));
     if ((_Z_MID(oam._header) != _Z_MID_T_OPEN) || !_Z_HAS_FLAG(oam._header, _Z_FLAG_T_OPEN_A)) {
+        // e.g. a Close from a router that rejects this session: do not read its body as an
+        // OpenAck (a garbage lease of a few ms would tear the new transport down at once)
+        if (_Z_MID(oam._header) == _Z_MID_T_CLOSE) {
+            _Z_ERROR("Session refused during the handshake: Close, reason %u", oam._body._close._reason);
+        } else {
+            _Z_ERROR("Unexpected message 0x%02x instead of OpenAck", oam._header);
+        }
         _z_t_msg_clear(&oam);
-        _Z_ERROR_LOG(_Z_ERR_MESSAGE_UNEXPECTED);
-        ret = _Z_ERR_MESSAGE_UNEXPECTED;
+        _Z_ERROR_RETURN(_Z_ERR_MESSAGE_UNEXPECTED);
     }
     // THIS LOG STRING USED IN TEST, change with caution
     _Z_DEBUG("Received Z_OPEN(Ack)");

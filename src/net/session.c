@@ -271,12 +271,41 @@ static void _z_reopen_drop_transport(_z_session_t *zs) {
 #endif
 }
 
+// Copy the declarations in their original order: a declaration can refer to an earlier one (a
+// subscriber or token to the key expression it was declared on), and the router drops it if that
+// one is not known yet. _z_network_message_slist_clone() reverses the order. Returns NULL with
+// *complete == false when out of memory.
+static _z_network_message_slist_t *_z_reopen_copy_declarations(const _z_network_message_slist_t *cache,
+                                                               bool *complete) {
+    _z_network_message_slist_t *copy = NULL;
+    size_t len = 0;
+    for (const _z_network_message_slist_t *iter = cache; iter != NULL; iter = _z_network_message_slist_next(iter)) {
+        copy = _z_network_message_slist_push_back(copy, _z_network_message_slist_value(iter));
+        len++;
+        if (_z_network_message_slist_len(copy) != len) {
+            _z_network_message_slist_free(&copy);
+            *complete = false;
+            return NULL;
+        }
+    }
+    *complete = true;
+    return copy;
+}
+
 z_result_t _z_reopen(_z_session_rc_t *zn) {
     z_result_t ret = _Z_RES_OK;
     _z_session_t *zs = _Z_RC_IN_VAL(zn);
     if (_z_config_is_empty(&zs->_config)) {
         return ret;
     }
+
+#if Z_FEATURE_MULTI_THREAD == 1
+    // A router that accepts the session and drops it right away would otherwise be reconnected to
+    // in a tight loop
+    if (zs->_reopened && (z_clock_elapsed_ms(&zs->_reopened_at) < 1000)) {
+        _z_reopen_wait(zn);
+    }
+#endif
 
     // Every failure is retried: a router that is restarting or still closing our previous
     // transport refuses the session for a while (e.g. it answers the handshake with a Close)
@@ -297,7 +326,15 @@ z_result_t _z_reopen(_z_session_rc_t *zn) {
         }
 
         // Restore the declarations before the read and lease tasks start, so that no other task can
-        // fail and tear down this transport while it is still in use here
+        // fail and tear down this transport while it is still in use here. Send from a copy: the
+        // application can declare or undeclare (and so change the cache) at the same time.
+        _z_session_mutex_lock(zs);
+        bool copied = false;
+        _z_network_message_slist_t *declarations = _z_reopen_copy_declarations(zs->_declaration_cache, &copied);
+        _z_session_mutex_unlock(zs);
+        if (!copied) {
+            ret = _Z_ERR_SYSTEM_OUT_OF_MEMORY;
+        }
 #if Z_FEATURE_MULTI_THREAD == 1
         // Senders wait for or skip the transport until the declarations are restored, so that no
         // message goes out on a resource or entity the router does not know yet
@@ -306,10 +343,11 @@ z_result_t _z_reopen(_z_session_rc_t *zn) {
             // Closed while connecting: do not hand a new transport to a closing session
             _z_reopen_drop_transport_locked(zs);
             _z_mutex_unlock(&zs->_mutex_transport);
+            _z_network_message_slist_free(&declarations);
             _Z_ERROR_RETURN(_Z_ERR_SESSION_CLOSED);
         }
 #endif
-        _z_network_message_slist_t *iter = zs->_declaration_cache;
+        _z_network_message_slist_t *iter = declarations;
         while ((ret == _Z_RES_OK) && (iter != NULL)) {
 #if Z_FEATURE_MULTI_THREAD == 1
             ret = _z_send_n_msg_reopen(zs, _z_network_message_slist_value(iter));
@@ -319,6 +357,7 @@ z_result_t _z_reopen(_z_session_rc_t *zn) {
 #endif
             iter = _z_network_message_slist_next(iter);
         }
+        _z_network_message_slist_free(&declarations);
         if (ret != _Z_RES_OK) {
             // The link failed right after opening (e.g. the router closed it): open a new one
             _Z_DEBUG("Send message during reopen failed: %i, next try in 1s", ret);
@@ -352,6 +391,8 @@ z_result_t _z_reopen(_z_session_rc_t *zn) {
             _z_reopen_wait(zn);
             continue;
         }
+        zs->_reopened = true;
+        zs->_reopened_at = z_clock_now();
 #endif  // Z_FEATURE_MULTI_THREAD == 1
         return _Z_RES_OK;
     }
@@ -361,7 +402,10 @@ void _z_cache_declaration(_z_session_t *zs, const _z_network_message_t *n_msg) {
     if (_z_config_is_empty(&zs->_config)) {
         return;
     }
+    // A reconnect copies the cache under the same lock
+    _z_session_mutex_lock(zs);
     zs->_declaration_cache = _z_network_message_slist_push_back(zs->_declaration_cache, n_msg);
+    _z_session_mutex_unlock(zs);
 }
 
 #define _Z_CACHE_DECLARATION_UNDECLARE_FILTER(tp)                                                                     \
@@ -381,7 +425,7 @@ static bool _z_cache_declaration_undeclare_filter_interest(const _z_network_mess
            left->_body._interest._interest._id == right->_body._interest._interest._id;
 }
 
-void _z_prune_declaration(_z_session_t *zs, const _z_network_message_t *n_msg) {
+static void _z_prune_declaration_inner(_z_session_t *zs, const _z_network_message_t *n_msg) {
 #ifdef Z_BUILD_DEBUG
     size_t cnt_before = _z_network_message_slist_len(zs->_declaration_cache);
 #endif
@@ -422,6 +466,13 @@ void _z_prune_declaration(_z_session_t *zs, const _z_network_message_t *n_msg) {
     size_t cnt_after = _z_network_message_slist_len(zs->_declaration_cache);
     assert(cnt_before == cnt_after + 1);
 #endif
+}
+
+void _z_prune_declaration(_z_session_t *zs, const _z_network_message_t *n_msg) {
+    // A reconnect copies the cache under the same lock
+    _z_session_mutex_lock(zs);
+    _z_prune_declaration_inner(zs, n_msg);
+    _z_session_mutex_unlock(zs);
 }
 #endif  // Z_FEATURE_AUTO_RECONNECT == 1
 

@@ -48,6 +48,9 @@ typedef struct _z_session_t {
     bool _tp_ready;      // _tp may be used for sending (false while it is torn down or reopened)
     bool _closing;       // the session is being closed: a reconnect in progress must stop
     bool _reconnecting;  // a lease task is tearing down or reopening _tp
+    // When the last reopen succeeded, used only by the reconnecting lease task
+    bool _reopened;
+    z_clock_t _reopened_at;
 #endif
 #endif  // Z_FEATURE_MULTI_THREAD == 1
 

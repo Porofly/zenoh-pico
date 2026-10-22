@@ -70,6 +70,7 @@ z_result_t _z_session_init(_z_session_t *zn, const _z_id_t *zid) {
     zn->_tp_ready = false;
     zn->_closing = false;
     zn->_reconnecting = false;
+    zn->_reopened = false;
 #endif
     zn->_mutex_inner_initialized = true;
 #endif

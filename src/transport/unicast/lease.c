@@ -43,6 +43,9 @@ z_result_t _zp_unicast_send_keep_alive(_z_transport_unicast_t *ztu) {
 
 #if Z_FEATURE_MULTI_THREAD == 1 && Z_FEATURE_UNICAST_TRANSPORT == 1
 
+// Longest sleep of the lease task before it checks for a failed link
+#define _ZP_UNICAST_LEASE_POLL_MS 100
+
 static void _zp_unicast_failed(_z_transport_unicast_t *ztu) {
     _z_session_rc_t zs = _z_session_weak_upgrade(&ztu->_common._session);
     if (_Z_RC_IS_NULL(&zs)) {
@@ -76,8 +79,13 @@ static void _zp_unicast_failed(_z_transport_unicast_t *ztu) {
         }
         _z_task_free(&ztu->_common._read_task);
     }
-    // Not under the transport lock: on a stalled link this send can block until TCP gives up
-    _z_unicast_transport_close(ztu, _Z_CLOSE_EXPIRED);
+    // Not under the transport lock: on a stalled link this send can block until the socket send
+    // timeout (if configured) or until TCP gives up. A link found dead cannot carry it.
+    if (!ztu->_common._link_failed) {
+        _z_unicast_transport_close(ztu, _Z_CLOSE_EXPIRED);
+    }
+    // The link is given up: reset it on close instead of lingering with unsent data
+    _z_link_set_abortive_close(ztu->_common._link);
 #if Z_FEATURE_AUTO_RECONNECT == 1
     // Wait for senders that started before _tp_ready was cleared
     _z_mutex_lock(&session->_mutex_transport);
@@ -119,6 +127,11 @@ void *_zp_unicast_lease_task(void *ztu_arg) {
     while (ztu->_common._lease_task_running) {
         // Process client lease
         if (mode == Z_WHATAMI_CLIENT) {
+            if (ztu->_common._link_failed) {
+                _Z_INFO("Closing session because the link failed");
+                _zp_unicast_failed(ztu);
+                return 0;
+            }
             if (next_lease <= 0) {
                 // Check if received data
                 if (curr_peer->common._received) {
@@ -218,11 +231,21 @@ void *_zp_unicast_lease_task(void *ztu_arg) {
             }
         }
 
-        // The keep alive and lease intervals are expressed in milliseconds
-        z_sleep_ms((size_t)interval);
+        // The keep alive and lease intervals are expressed in milliseconds. Sleep in short slices
+        // so that a link found dead by the read task or a sender is torn down at once.
+        int slept = 0;
+        while ((slept < interval) && !((mode == Z_WHATAMI_CLIENT) && ztu->_common._link_failed) &&
+               ztu->_common._lease_task_running) {
+            int slice = interval - slept;
+            if (slice > _ZP_UNICAST_LEASE_POLL_MS) {
+                slice = _ZP_UNICAST_LEASE_POLL_MS;
+            }
+            z_sleep_ms((size_t)slice);
+            slept += slice;
+        }
 
-        next_lease = next_lease - interval;
-        next_keep_alive = next_keep_alive - interval;
+        next_lease = next_lease - slept;
+        next_keep_alive = next_keep_alive - slept;
     }
     return 0;
 }

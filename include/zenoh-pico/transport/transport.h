@@ -141,6 +141,11 @@ typedef struct {
     bool *_accept_task_running;
     volatile bool _read_task_running;
     volatile bool _lease_task_running;
+    // Set by the read task or a sender when the link is found dead (peer closed it, send failed),
+    // so that the lease task tears it down and reconnects without waiting for the lease. Written
+    // without a lock: it only ever goes from false to true while the transport exists (it is reset
+    // only when a transport is created, before its tasks start), and readers merely poll it.
+    volatile bool _link_failed;
 #endif
 // Transport batching
 #if Z_FEATURE_BATCHING == 1

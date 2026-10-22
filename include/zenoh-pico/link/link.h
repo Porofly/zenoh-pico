@@ -182,6 +182,8 @@ size_t _z_link_recv_exact_zbuf(const _z_link_t *zl, _z_zbuf_t *zbf, size_t len, 
                                _z_sys_net_socket_t *socket);
 size_t _z_link_socket_recv_zbuf(const _z_link_t *link, _z_zbuf_t *zbf, const _z_sys_net_socket_t socket);
 const _z_sys_net_socket_t *_z_link_get_socket(const _z_link_t *link);
+// Make closing this link abortive (reset, discard unsent data) instead of lingering on a dead peer
+void _z_link_set_abortive_close(_z_link_t *link);
 
 #ifdef __cplusplus
 }

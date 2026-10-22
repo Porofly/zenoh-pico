@@ -53,6 +53,18 @@ static _z_zint_t _z_transport_tx_get_sn(_z_transport_common_t *ztc, z_reliabilit
     return sn;
 }
 
+// Send the write buffer on the transport's own link. A failed send on a stream link can leave a
+// partial message on the wire, so the link is unusable: flag it for the lease task to reconnect.
+static z_result_t _z_transport_tx_send_wbuf_on_link(_z_transport_common_t *ztc) {
+    z_result_t ret = _z_link_send_wbuf(ztc->_link, &ztc->_wbuf, NULL);
+#if Z_FEATURE_MULTI_THREAD == 1
+    if ((ret != _Z_RES_OK) && (ztc->_link->_cap._flow == Z_LINK_CAP_FLOW_STREAM)) {
+        ztc->_link_failed = true;
+    }
+#endif
+    return ret;
+}
+
 #if Z_FEATURE_FRAGMENTATION == 1
 static z_result_t _z_transport_tx_send_fragment_inner(_z_transport_common_t *ztc, _z_wbuf_t *frag_buff,
                                                       const _z_network_message_t *n_msg, z_reliability_t reliability,
@@ -77,7 +89,7 @@ static z_result_t _z_transport_tx_send_fragment_inner(_z_transport_common_t *ztc
         // Send fragment
         __unsafe_z_finalize_wbuf(&ztc->_wbuf, ztc->_link->_cap._flow);
         if (peers == NULL) {
-            _Z_RETURN_IF_ERR(_z_link_send_wbuf(ztc->_link, &ztc->_wbuf, NULL));
+            _Z_RETURN_IF_ERR(_z_transport_tx_send_wbuf_on_link(ztc));
         } else {
             _z_transport_peer_unicast_slist_t *curr_list = peers;
             while (curr_list != NULL) {
@@ -132,7 +144,7 @@ static z_result_t _z_transport_tx_flush_buffer(_z_transport_common_t *ztc, _z_tr
     __unsafe_z_finalize_wbuf(&ztc->_wbuf, ztc->_link->_cap._flow);
     // Send network message
     if (peers == NULL) {
-        _Z_RETURN_IF_ERR(_z_link_send_wbuf(ztc->_link, &ztc->_wbuf, NULL));
+        _Z_RETURN_IF_ERR(_z_transport_tx_send_wbuf_on_link(ztc));
     } else {
         _z_transport_peer_unicast_slist_t *curr_list = peers;
         while (curr_list != NULL) {
@@ -535,7 +547,9 @@ static z_result_t _z_send_lock_transport(_z_session_t *zn, z_congestion_control_
     } else {
         _z_mutex_lock(&zn->_mutex_transport);
     }
-    if (!zn->_tp_ready) {
+    // Once the link is found dead, fail at once instead of waiting for another send timeout each: the
+    // lease task needs this lock to tear the transport down
+    if (!zn->_tp_ready || _z_transport_get_common(&zn->_tp)->_link_failed) {
         _z_mutex_unlock(&zn->_mutex_transport);
         return _Z_ERR_TRANSPORT_NOT_AVAILABLE;
     }

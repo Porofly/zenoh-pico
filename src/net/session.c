@@ -257,6 +257,7 @@ static void _z_reopen_drop_transport_locked(_z_session_t *zs) {
     zs->_tp_ready = false;
 #endif
     if (zs->_tp._type != _Z_TRANSPORT_NONE) {
+        _z_link_set_abortive_close(_z_transport_get_common(&zs->_tp)->_link);
         _z_transport_clear(&zs->_tp);
     }
 }

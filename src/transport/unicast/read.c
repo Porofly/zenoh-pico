@@ -74,11 +74,28 @@ static z_result_t _z_unicast_process_messages(_z_transport_unicast_t *ztu, _z_tr
     return _Z_RES_OK;
 }
 
+// Receive into the transport buffer. Returns false when the stream ended or the connection broke
+// (recv returned 0 with room in the buffer): the link is dead, flag it so the lease task reconnects
+// at once.
+static bool _z_unicast_client_recv(_z_transport_unicast_t *ztu, _z_transport_peer_unicast_t *peer) {
+    bool room = _z_zbuf_space_left(&ztu->_common._zbuf) > 0;
+    size_t rb = _z_link_socket_recv_zbuf(ztu->_common._link, &ztu->_common._zbuf, peer->_socket);
+    if ((rb == 0) && room) {
+#if Z_FEATURE_MULTI_THREAD == 1
+        ztu->_common._link_failed = true;
+#endif
+        return false;
+    }
+    return true;
+}
+
 static bool _z_unicast_client_read(_z_transport_unicast_t *ztu, _z_transport_peer_unicast_t *peer, size_t *to_read) {
     switch (ztu->_common._link->_cap._flow) {
         case Z_LINK_CAP_FLOW_STREAM:
             if (_z_zbuf_len(&ztu->_common._zbuf) < _Z_MSG_LEN_ENC_SIZE) {
-                _z_link_socket_recv_zbuf(ztu->_common._link, &ztu->_common._zbuf, peer->_socket);
+                if (!_z_unicast_client_recv(ztu, peer)) {
+                    return false;
+                }
                 if (_z_zbuf_len(&ztu->_common._zbuf) < _Z_MSG_LEN_ENC_SIZE) {
                     _z_zbuf_compact(&ztu->_common._zbuf);
                     return false;
@@ -88,7 +105,10 @@ static bool _z_unicast_client_read(_z_transport_unicast_t *ztu, _z_transport_pee
             *to_read = _z_read_stream_size(&ztu->_common._zbuf);
             // Read data
             if (_z_zbuf_len(&ztu->_common._zbuf) < *to_read) {
-                _z_link_socket_recv_zbuf(ztu->_common._link, &ztu->_common._zbuf, peer->_socket);
+                if (!_z_unicast_client_recv(ztu, peer)) {
+                    _z_zbuf_set_rpos(&ztu->_common._zbuf, _z_zbuf_get_rpos(&ztu->_common._zbuf) - _Z_MSG_LEN_ENC_SIZE);
+                    return false;
+                }
                 if (_z_zbuf_len(&ztu->_common._zbuf) < *to_read) {
                     _z_zbuf_set_rpos(&ztu->_common._zbuf, _z_zbuf_get_rpos(&ztu->_common._zbuf) - _Z_MSG_LEN_ENC_SIZE);
                     _z_zbuf_compact(&ztu->_common._zbuf);
@@ -370,6 +390,8 @@ void *_zp_unicast_read_task(void *ztu_arg) {
             }
             // Process data
             if (_z_unicast_process_messages(ztu, curr_peer, to_read) != _Z_RES_OK) {
+                // e.g. the router closed the session: let the lease task reconnect now
+                ztu->_common._link_failed = true;
                 ztu->_common._read_task_running = false;
                 continue;
             }

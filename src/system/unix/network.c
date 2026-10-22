@@ -184,6 +184,35 @@ z_result_t _z_create_endpoint_tcp(_z_sys_net_endpoint_t *ep, const char *s_addre
 void _z_free_endpoint_tcp(_z_sys_net_endpoint_t *ep) { freeaddrinfo(ep->_iptcp); }
 
 /*------------------ TCP sockets ------------------*/
+#if Z_CONFIG_SOCKET_CONNECT_TIMEOUT > 0
+// Connect with a deadline. A blocking connect to a host that does not answer lasts until TCP gives up
+// on its SYN retransmissions (more than a minute on NuttX, longer on Linux), and the task doing it
+// cannot notice meanwhile that the session is being closed.
+static int _z_connect_timeout(int fd, const struct sockaddr *addr, socklen_t addrlen) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if ((flags < 0) || (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)) {
+        return -1;
+    }
+    int ret = connect(fd, addr, addrlen);
+    if ((ret < 0) && (errno == EINPROGRESS)) {
+        struct pollfd pfd = {.fd = fd, .events = POLLOUT, .revents = 0};
+        ret = -1;  // Also on a timeout or an interrupted poll: the caller retries
+        if ((poll(&pfd, 1, Z_CONFIG_SOCKET_CONNECT_TIMEOUT) == 1) && ((pfd.revents & POLLOUT) != 0) &&
+            ((pfd.revents & (POLLERR | POLLHUP)) == 0)) {
+            int err = 0;
+            socklen_t len = sizeof(err);
+            if ((getsockopt(fd, SOL_SOCKET, SO_ERROR, (void *)&err, &len) == 0) && (err == 0)) {
+                ret = 0;
+            }
+        }
+    }
+    if (fcntl(fd, F_SETFL, flags) < 0) {
+        ret = -1;
+    }
+    return ret;
+}
+#endif
+
 z_result_t _z_open_tcp(_z_sys_net_socket_t *sock, const _z_sys_net_endpoint_t rep, uint32_t tout) {
     z_result_t ret = _Z_RES_OK;
 
@@ -196,6 +225,16 @@ z_result_t _z_open_tcp(_z_sys_net_socket_t *sock, const _z_sys_net_endpoint_t re
             _Z_ERROR_LOG(_Z_ERR_GENERIC);
             ret = _Z_ERR_GENERIC;
         }
+#if Z_CONFIG_SOCKET_SEND_TIMEOUT > 0
+        // Bound a send on a stalled link: a failed send flags the link, and the lease task reconnects
+        z_time_t stv;
+        stv.tv_sec = (time_t)(Z_CONFIG_SOCKET_SEND_TIMEOUT / 1000);
+        stv.tv_usec = (suseconds_t)((Z_CONFIG_SOCKET_SEND_TIMEOUT % 1000) * 1000);
+        if ((ret == _Z_RES_OK) && (setsockopt(sock->_fd, SOL_SOCKET, SO_SNDTIMEO, (char *)&stv, sizeof(stv)) < 0)) {
+            _Z_ERROR_LOG(_Z_ERR_GENERIC);
+            ret = _Z_ERR_GENERIC;
+        }
+#endif
 
         int flags = 1;
         if ((ret == _Z_RES_OK) &&
@@ -225,7 +264,11 @@ z_result_t _z_open_tcp(_z_sys_net_socket_t *sock, const _z_sys_net_endpoint_t re
 #endif
         struct addrinfo *it = NULL;
         for (it = rep._iptcp; it != NULL; it = it->ai_next) {
+#if Z_CONFIG_SOCKET_CONNECT_TIMEOUT > 0
+            if ((ret == _Z_RES_OK) && (_z_connect_timeout(sock->_fd, it->ai_addr, it->ai_addrlen) < 0)) {
+#else
             if ((ret == _Z_RES_OK) && (connect(sock->_fd, it->ai_addr, it->ai_addrlen) < 0)) {
+#endif
                 if (it->ai_next == NULL) {
                     _Z_ERROR_LOG(_Z_ERR_GENERIC);
                     ret = _Z_ERR_GENERIC;
@@ -346,11 +389,21 @@ void _z_close_tcp(_z_sys_net_socket_t *sock) {
 size_t _z_read_tcp(const _z_sys_net_socket_t sock, uint8_t *ptr, size_t len) {
     ssize_t rb = recv(sock._fd, ptr, len, 0);
     if (rb < (ssize_t)0) {
-        // Errno can be 11(EAGAIN) because of SO_RCVTIMEO
-        if (errno != EAGAIN) {
-            _Z_DEBUG("Errno: %d\n", errno);
+        // Errno can be 11(EAGAIN) because of SO_RCVTIMEO. NuttX also fails a recv with EBUSY when no
+        // network callback is free, and with ENOMEM/ENOBUFS when it is short of buffers: the link
+        // is fine, try again.
+        bool no_data =
+            (errno == EAGAIN) || (errno == EINTR) || (errno == EBUSY) || (errno == ENOMEM) || (errno == ENOBUFS);
+#if EWOULDBLOCK != EAGAIN
+        no_data = no_data || (errno == EWOULDBLOCK);
+#endif
+        if (no_data) {
+            return SIZE_MAX;
         }
-        return SIZE_MAX;
+        // The connection is gone (reset, retransmission timeout, interface down): report it like the
+        // end of the stream, which flags the link as failed. NuttX returns 0 only after a FIN.
+        _Z_DEBUG("Errno: %d\n", errno);
+        return 0;
     }
 
     return (size_t)rb;
@@ -368,7 +421,7 @@ size_t _z_read_exact_tcp(const _z_sys_net_socket_t sock, uint8_t *ptr, size_t le
         }
 
         n = n + rb;
-        pos = _z_ptr_u8_offset(pos, (ptrdiff_t)n);
+        pos = _z_ptr_u8_offset(pos, (ptrdiff_t)rb);
     } while (n != len);
 
     return n;

@@ -21,6 +21,10 @@
 #include "zenoh-pico/link/manager.h"
 #include "zenoh-pico/utils/logging.h"
 
+#if Z_FEATURE_LINK_TCP == 1 && (defined(ZENOH_LINUX) || defined(ZENOH_MACOS) || defined(ZENOH_BSD))
+#include <sys/socket.h>
+#endif
+
 z_result_t _z_open_socket(const _z_string_t *locator, const _z_config_t *session_cfg, _z_sys_net_socket_t *socket) {
 #if Z_FEATURE_LINK_TLS != 1
     _ZP_UNUSED(session_cfg);
@@ -227,6 +231,21 @@ z_result_t _z_link_send_wbuf(const _z_link_t *link, const _z_wbuf_t *wbf, _z_sys
     }
 
     return ret;
+}
+
+void _z_link_set_abortive_close(_z_link_t *link) {
+#if Z_FEATURE_LINK_TCP == 1 && (defined(ZENOH_LINUX) || defined(ZENOH_MACOS) || defined(ZENOH_BSD))
+    // TCP sockets are opened with SO_LINGER = lease. On a dead link that keeps the connection and
+    // its unsent data (IOBs on NuttX) for the whole lease after every reconnect attempt.
+    if ((link != NULL) && (link->_type == _Z_LINK_TYPE_TCP) && (link->_socket._tcp._sock._fd >= 0)) {
+        struct linger ling;
+        ling.l_onoff = 1;
+        ling.l_linger = 0;
+        (void)setsockopt(link->_socket._tcp._sock._fd, SOL_SOCKET, SO_LINGER, (void *)&ling, sizeof(ling));
+    }
+#else
+    _ZP_UNUSED(link);
+#endif
 }
 
 const _z_sys_net_socket_t *_z_link_get_socket(const _z_link_t *link) {

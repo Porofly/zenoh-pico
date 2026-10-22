@@ -182,7 +182,18 @@ void _z_session_clear(_z_session_t *zn) {
         _z_mutex_lock(&zn->_mutex_transport);
 #endif
         if (!_z_session_is_closed(zn)) {
+#if Z_FEATURE_MULTI_THREAD == 1
+            _z_transport_common_t *ztc = _z_transport_get_common(&zn->_tp);
+            if (ztc->_link_failed) {
+                // A dead link cannot carry the close message, and a graceful close would keep the
+                // unsent data (and the buffers holding it) for the linger time
+                _z_link_set_abortive_close(ztc->_link);
+            } else {
+                _z_close(zn);
+            }
+#else
             _z_close(zn);
+#endif
         }
 #if Z_FEATURE_MULTI_THREAD == 1 && Z_FEATURE_AUTO_RECONNECT == 1
         _z_mutex_unlock(&zn->_mutex_transport);

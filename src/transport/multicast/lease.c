@@ -58,21 +58,57 @@ z_result_t _zp_multicast_send_keep_alive(_z_transport_multicast_t *ztm) {
 
 #if Z_FEATURE_MULTI_THREAD == 1 && (Z_FEATURE_MULTICAST_TRANSPORT == 1 || Z_FEATURE_RAWETH_TRANSPORT == 1)
 
+// Same teardown and reconnect protocol as _zp_unicast_failed. Does not return.
 static void _zp_multicast_failed(_z_transport_multicast_t *ztm) {
-    _ZP_UNUSED(ztm);
-
+    _z_session_rc_t zs = _z_session_weak_upgrade(&ztm->_common._session);
+    if (_Z_RC_IS_NULL(&zs)) {
+        // The session is being dropped, whoever drops it stops and joins this task
+        _z_task_exit();
+    }
+    _z_session_t *session = _Z_RC_IN_VAL(&zs);
+#if Z_FEATURE_AUTO_RECONNECT == 1
+    _z_mutex_lock(&session->_mutex_transport);
+    if (session->_closing) {
+        _z_mutex_unlock(&session->_mutex_transport);
+        _z_session_rc_drop(&zs);
+        _z_task_exit();
+    }
+    session->_reconnecting = true;
+    session->_tp_ready = false;
+    _z_mutex_unlock(&session->_mutex_transport);
+#endif
 #if Z_FEATURE_LIVELINESS == 1 && Z_FEATURE_SUBSCRIPTION == 1
     _z_liveliness_subscription_undeclare_all(_z_transport_common_get_session(&ztm->_common));
 #endif
+    // Stop and join the read task before its transport is freed
+    ztm->_common._read_task_running = false;
+    if (ztm->_common._read_task != NULL) {
+        if (_z_task_join(ztm->_common._read_task) != _Z_RES_OK) {
+            _Z_ERROR("Unable to join the read task");
+        }
+        _z_task_free(&ztm->_common._read_task);
+    }
 #if Z_FEATURE_AUTO_RECONNECT == 1
-    _z_session_rc_t zs = _z_session_weak_upgrade(&ztm->_common._session);
+    _z_mutex_lock(&session->_mutex_transport);
 #endif
+    // Only this (lease) task is left to detach
     _z_multicast_transport_clear(ztm, true);
-
+    // Without this, closing the session would clear the transport a second time
+    session->_tp._type = _Z_TRANSPORT_NONE;
 #if Z_FEATURE_AUTO_RECONNECT == 1
-    _z_reopen(&zs);
-    _z_session_rc_drop(&zs);
+    _z_mutex_unlock(&session->_mutex_transport);
+
+    z_result_t ret = _z_reopen(&zs);
+    if (ret != _Z_RES_OK) {
+        _Z_INFO("Reconnect stopped: %i", ret);
+    }
+    _z_mutex_lock(&session->_mutex_transport);
+    session->_reconnecting = false;
+    _z_mutex_unlock(&session->_mutex_transport);
 #endif
+    _z_session_rc_drop(&zs);
+    // The transport this task served is gone (a reopen started new tasks)
+    _z_task_exit();
 }
 
 static _z_zint_t _z_get_minimum_lease(_z_transport_peer_multicast_slist_t *peers, _z_zint_t local_lease) {

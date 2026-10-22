@@ -41,6 +41,14 @@ typedef struct _z_session_t {
 #if Z_FEATURE_MULTI_THREAD == 1
     bool _mutex_inner_initialized;
     _z_mutex_t _mutex_inner;
+#if Z_FEATURE_AUTO_RECONNECT == 1
+    // Guards the fields below and is held around every send, so that a reconnect never frees the
+    // transport under a sender. Never held across connect, handshake or a task join.
+    _z_mutex_t _mutex_transport;
+    bool _tp_ready;      // _tp may be used for sending (false while it is torn down or reopened)
+    bool _closing;       // the session is being closed: a reconnect in progress must stop
+    bool _reconnecting;  // a lease task is tearing down or reopening _tp
+#endif
 #endif  // Z_FEATURE_MULTI_THREAD == 1
 
     // Zenoh-pico is considering a single transport per session.

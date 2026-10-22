@@ -151,7 +151,8 @@ static z_result_t _z_open_inner(_z_session_rc_t *zs, _z_string_t *locator, const
     return ret;
 }
 
-z_result_t _z_open(_z_session_rc_t *zn, _z_config_t *config, const _z_id_t *zid) {
+// Open the transport. It is not marked ready for sending: that is up to the caller.
+static z_result_t _z_open_transport(_z_session_rc_t *zn, _z_config_t *config, const _z_id_t *zid) {
     z_result_t ret = _Z_RES_OK;
     _Z_RC_IN_VAL(zn)->_tp._type = _Z_TRANSPORT_NONE;
 
@@ -206,7 +207,69 @@ z_result_t _z_open(_z_session_rc_t *zn, _z_config_t *config, const _z_id_t *zid)
     return ret;
 }
 
+z_result_t _z_open(_z_session_rc_t *zn, _z_config_t *config, const _z_id_t *zid) {
+    z_result_t ret = _z_open_transport(zn, config, zid);
+#if Z_FEATURE_MULTI_THREAD == 1 && Z_FEATURE_AUTO_RECONNECT == 1
+    if (ret == _Z_RES_OK) {
+        _z_session_t *zs = _Z_RC_IN_VAL(zn);
+        _z_mutex_lock(&zs->_mutex_transport);
+        zs->_tp_ready = !zs->_closing;
+        _z_mutex_unlock(&zs->_mutex_transport);
+    }
+#endif
+    return ret;
+}
+
 #if Z_FEATURE_AUTO_RECONNECT == 1
+
+#if Z_FEATURE_MULTI_THREAD == 1
+// Stop when the session is being closed or nobody but the reconnect holds it any more. The caller
+// holds _mutex_transport.
+static bool _z_reopen_should_stop_locked(_z_session_rc_t *zn) {
+    return _Z_RC_IN_VAL(zn)->_closing || (_z_rc_strong_count(zn->_cnt) <= 1);
+}
+
+static bool _z_reopen_should_stop(_z_session_rc_t *zn) {
+    _z_session_t *zs = _Z_RC_IN_VAL(zn);
+    _z_mutex_lock(&zs->_mutex_transport);
+    bool stop = _z_reopen_should_stop_locked(zn);
+    _z_mutex_unlock(&zs->_mutex_transport);
+    return stop;
+}
+#endif
+
+// Pause before the next reopen attempt, cut short when the session is being closed
+static void _z_reopen_wait(_z_session_rc_t *zn) {
+#if Z_FEATURE_MULTI_THREAD == 1
+    for (int i = 0; (i < 10) && !_z_reopen_should_stop(zn); i++) {
+        z_sleep_ms(100);
+    }
+#else
+    _ZP_UNUSED(zn);
+    z_sleep_s(1);
+#endif
+}
+
+// Clear a transport that _z_open_transport created (fully or partly) but that cannot be used. No task
+// of it may be running. With multi-thread, the caller holds _mutex_transport.
+static void _z_reopen_drop_transport_locked(_z_session_t *zs) {
+#if Z_FEATURE_MULTI_THREAD == 1
+    zs->_tp_ready = false;
+#endif
+    if (zs->_tp._type != _Z_TRANSPORT_NONE) {
+        _z_transport_clear(&zs->_tp);
+    }
+}
+
+static void _z_reopen_drop_transport(_z_session_t *zs) {
+#if Z_FEATURE_MULTI_THREAD == 1
+    _z_mutex_lock(&zs->_mutex_transport);
+#endif
+    _z_reopen_drop_transport_locked(zs);
+#if Z_FEATURE_MULTI_THREAD == 1
+    _z_mutex_unlock(&zs->_mutex_transport);
+#endif
+}
 
 z_result_t _z_reopen(_z_session_rc_t *zn) {
     z_result_t ret = _Z_RES_OK;
@@ -215,43 +278,83 @@ z_result_t _z_reopen(_z_session_rc_t *zn) {
         return ret;
     }
 
-    do {
-        ret = _z_open(zn, &zs->_config, &zs->_local_zid);
+    // Every failure is retried: a router that is restarting or still closing our previous
+    // transport refuses the session for a while (e.g. it answers the handshake with a Close)
+    while (true) {
+#if Z_FEATURE_MULTI_THREAD == 1
+        if (_z_reopen_should_stop(zn)) {
+            _Z_ERROR_RETURN(_Z_ERR_SESSION_CLOSED);
+        }
+#endif
+        // Not under the transport lock: connect and handshake can block for a long time, senders
+        // see _tp_ready == false until the declarations are restored
+        ret = _z_open_transport(zn, &zs->_config, &zs->_local_zid);
         if (ret != _Z_RES_OK) {
-            // Every failure is retried: a router that is restarting or still closing our previous
-            // transport refuses the session for a while (e.g. it answers the handshake with a Close)
             _Z_DEBUG("Reopen failed: %i, next try in 1s", ret);
-            z_sleep_s(1);
+            _z_reopen_drop_transport(zs);
+            _z_reopen_wait(zn);
             continue;
         }
 
+        // Restore the declarations before the read and lease tasks start, so that no other task can
+        // fail and tear down this transport while it is still in use here
 #if Z_FEATURE_MULTI_THREAD == 1
-        ret = _zp_start_lease_task(zs, zs->_lease_task_attr);
-        if (ret != _Z_RES_OK) {
-            return ret;
+        // Senders wait for or skip the transport until the declarations are restored, so that no
+        // message goes out on a resource or entity the router does not know yet
+        _z_mutex_lock(&zs->_mutex_transport);
+        if (_z_reopen_should_stop_locked(zn)) {
+            // Closed while connecting: do not hand a new transport to a closing session
+            _z_reopen_drop_transport_locked(zs);
+            _z_mutex_unlock(&zs->_mutex_transport);
+            _Z_ERROR_RETURN(_Z_ERR_SESSION_CLOSED);
         }
+#endif
+        _z_network_message_slist_t *iter = zs->_declaration_cache;
+        while ((ret == _Z_RES_OK) && (iter != NULL)) {
+#if Z_FEATURE_MULTI_THREAD == 1
+            ret = _z_send_n_msg_reopen(zs, _z_network_message_slist_value(iter));
+#else
+            ret = _z_send_n_msg(zs, _z_network_message_slist_value(iter), Z_RELIABILITY_RELIABLE,
+                                Z_CONGESTION_CONTROL_BLOCK, NULL);
+#endif
+            iter = _z_network_message_slist_next(iter);
+        }
+        if (ret != _Z_RES_OK) {
+            // The link failed right after opening (e.g. the router closed it): open a new one
+            _Z_DEBUG("Send message during reopen failed: %i, next try in 1s", ret);
+            _z_reopen_drop_transport_locked(zs);
+#if Z_FEATURE_MULTI_THREAD == 1
+            _z_mutex_unlock(&zs->_mutex_transport);
+#endif
+            _z_reopen_wait(zn);
+            continue;
+        }
+#if Z_FEATURE_MULTI_THREAD == 1
+        zs->_tp_ready = true;
+        _z_mutex_unlock(&zs->_mutex_transport);
+
+        // Read task first: if the lease task cannot start, the read task stops within a socket timeout
         ret = _zp_start_read_task(zs, zs->_read_task_attr);
-        if (ret != _Z_RES_OK) {
-            return ret;
-        }
-#endif  // Z_FEATURE_MULTI_THREAD == 1
-
-        if (ret == _Z_RES_OK && !_z_network_message_slist_is_empty(zs->_declaration_cache)) {
-            _z_network_message_slist_t *iter = zs->_declaration_cache;
-            while (iter != NULL) {
-                _z_network_message_t *n_msg = _z_network_message_slist_value(iter);
-                ret = _z_send_n_msg(zs, n_msg, Z_RELIABILITY_RELIABLE, Z_CONGESTION_CONTROL_BLOCK, NULL);
-                if (ret != _Z_RES_OK) {
-                    _Z_DEBUG("Send message during reopen failed: %i", ret);
-                    continue;
+        if (ret == _Z_RES_OK) {
+            ret = _zp_start_lease_task(zs, zs->_lease_task_attr);
+            if (ret != _Z_RES_OK) {
+                _z_transport_common_t *ztc = _z_transport_get_common(&zs->_tp);
+                ztc->_read_task_running = false;
+                if (_z_task_join(ztc->_read_task) != _Z_RES_OK) {
+                    _Z_ERROR("Unable to join the read task");
                 }
-
-                iter = _z_network_message_slist_next(iter);
+                _z_task_free(&ztc->_read_task);
             }
         }
-    } while (ret != _Z_RES_OK);
-
-    return ret;
+        if (ret != _Z_RES_OK) {
+            _Z_ERROR("Unable to start the transport tasks: %i, next try in 1s", ret);
+            _z_reopen_drop_transport(zs);
+            _z_reopen_wait(zn);
+            continue;
+        }
+#endif  // Z_FEATURE_MULTI_THREAD == 1
+        return _Z_RES_OK;
+    }
 }
 
 void _z_cache_declaration(_z_session_t *zs, const _z_network_message_t *n_msg) {

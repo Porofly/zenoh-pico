@@ -476,8 +476,8 @@ z_result_t __unsafe_z_serialize_zenoh_fragment(_z_wbuf_t *dst, _z_wbuf_t *src, z
     return ret;
 }
 
-z_result_t _z_send_n_msg(_z_session_t *zn, const _z_network_message_t *z_msg, z_reliability_t reliability,
-                         z_congestion_control_t cong_ctrl, void *peer) {
+static z_result_t _z_send_n_msg_inner(_z_session_t *zn, const _z_network_message_t *z_msg, z_reliability_t reliability,
+                                      z_congestion_control_t cong_ctrl, void *peer) {
     z_result_t ret = _Z_RES_OK;
     // Call transport function
     switch (zn->_tp._type) {
@@ -523,7 +523,43 @@ z_result_t _z_send_n_msg(_z_session_t *zn, const _z_network_message_t *z_msg, z_
     return ret;
 }
 
-z_result_t _z_send_n_batch(_z_session_t *zn, z_congestion_control_t cong_ctrl) {
+#if Z_FEATURE_MULTI_THREAD == 1 && Z_FEATURE_AUTO_RECONNECT == 1
+// The lease task may tear the transport down and reopen it at any time: hold the session transport
+// lock while sending, and only send on a transport that is ready. With congestion control drop,
+// do not wait for the lock (a teardown can hold it while the link is stalled), drop the message.
+static z_result_t _z_send_lock_transport(_z_session_t *zn, z_congestion_control_t cong_ctrl) {
+    if (cong_ctrl == Z_CONGESTION_CONTROL_DROP) {
+        if (_z_mutex_try_lock(&zn->_mutex_transport) != _Z_RES_OK) {
+            return _Z_ERR_TRANSPORT_TX_FAILED;
+        }
+    } else {
+        _z_mutex_lock(&zn->_mutex_transport);
+    }
+    if (!zn->_tp_ready) {
+        _z_mutex_unlock(&zn->_mutex_transport);
+        return _Z_ERR_TRANSPORT_NOT_AVAILABLE;
+    }
+    return _Z_RES_OK;
+}
+
+z_result_t _z_send_n_msg_reopen(_z_session_t *zn, const _z_network_message_t *z_msg) {
+    return _z_send_n_msg_inner(zn, z_msg, Z_RELIABILITY_RELIABLE, Z_CONGESTION_CONTROL_BLOCK, NULL);
+}
+#endif
+
+z_result_t _z_send_n_msg(_z_session_t *zn, const _z_network_message_t *z_msg, z_reliability_t reliability,
+                         z_congestion_control_t cong_ctrl, void *peer) {
+#if Z_FEATURE_MULTI_THREAD == 1 && Z_FEATURE_AUTO_RECONNECT == 1
+    _Z_RETURN_IF_ERR(_z_send_lock_transport(zn, cong_ctrl));
+#endif
+    z_result_t ret = _z_send_n_msg_inner(zn, z_msg, reliability, cong_ctrl, peer);
+#if Z_FEATURE_MULTI_THREAD == 1 && Z_FEATURE_AUTO_RECONNECT == 1
+    _z_mutex_unlock(&zn->_mutex_transport);
+#endif
+    return ret;
+}
+
+static z_result_t _z_send_n_batch_inner(_z_session_t *zn, z_congestion_control_t cong_ctrl) {
     z_result_t ret = _Z_RES_OK;
     // Call transport function
     switch (zn->_tp._type) {
@@ -551,5 +587,16 @@ z_result_t _z_send_n_batch(_z_session_t *zn, z_congestion_control_t cong_ctrl) {
             ret = _Z_ERR_TRANSPORT_NOT_AVAILABLE;
             break;
     }
+    return ret;
+}
+
+z_result_t _z_send_n_batch(_z_session_t *zn, z_congestion_control_t cong_ctrl) {
+#if Z_FEATURE_MULTI_THREAD == 1 && Z_FEATURE_AUTO_RECONNECT == 1
+    _Z_RETURN_IF_ERR(_z_send_lock_transport(zn, cong_ctrl));
+#endif
+    z_result_t ret = _z_send_n_batch_inner(zn, cong_ctrl);
+#if Z_FEATURE_MULTI_THREAD == 1 && Z_FEATURE_AUTO_RECONNECT == 1
+    _z_mutex_unlock(&zn->_mutex_transport);
+#endif
     return ret;
 }

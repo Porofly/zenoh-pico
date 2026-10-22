@@ -44,23 +44,62 @@ z_result_t _zp_unicast_send_keep_alive(_z_transport_unicast_t *ztu) {
 #if Z_FEATURE_MULTI_THREAD == 1 && Z_FEATURE_UNICAST_TRANSPORT == 1
 
 static void _zp_unicast_failed(_z_transport_unicast_t *ztu) {
+    _z_session_rc_t zs = _z_session_weak_upgrade(&ztu->_common._session);
+    if (_Z_RC_IS_NULL(&zs)) {
+        // The session is being dropped, whoever drops it stops and joins this task
+        _z_task_exit();
+    }
+    _z_session_t *session = _Z_RC_IN_VAL(&zs);
+#if Z_FEATURE_AUTO_RECONNECT == 1
+    _z_mutex_lock(&session->_mutex_transport);
+    if (session->_closing) {
+        // The session is being closed, whoever closes it stops and joins this task
+        _z_mutex_unlock(&session->_mutex_transport);
+        _z_session_rc_drop(&zs);
+        _z_task_exit();
+    }
+    // From here on this task owns _tp: senders stop using it and a session close waits for us
+    session->_reconnecting = true;
+    session->_tp_ready = false;
+    _z_mutex_unlock(&session->_mutex_transport);
+#endif
 #if Z_FEATURE_LIVELINESS == 1 && Z_FEATURE_SUBSCRIPTION == 1
     _z_liveliness_subscription_undeclare_all(_z_transport_common_get_session(&ztu->_common));
 #endif
-#if Z_FEATURE_AUTO_RECONNECT == 1
-    _z_session_rc_t zs = _z_session_weak_upgrade(&ztu->_common._session);
-#endif
-    _z_unicast_transport_close(ztu, _Z_CLOSE_EXPIRED);
-    _z_unicast_transport_clear(ztu, true);
-
-#if Z_FEATURE_AUTO_RECONNECT == 1
-    z_result_t ret = _z_reopen(&zs);
-    _z_session_rc_drop(&zs);
-    if (ret != _Z_RES_OK) {
-        _Z_ERROR("Reopen failed: %i", ret);
+    // Stop the read task and wait for it: it uses the peer, buffers and link that are freed below,
+    // and a detached one would keep running on the reopened transport (same memory, same socket
+    // fd). It wakes up at least every socket timeout.
+    ztu->_common._read_task_running = false;
+    if (ztu->_common._read_task != NULL) {
+        if (_z_task_join(ztu->_common._read_task) != _Z_RES_OK) {
+            _Z_ERROR("Unable to join the read task");
+        }
+        _z_task_free(&ztu->_common._read_task);
     }
+    // Not under the transport lock: on a stalled link this send can block until TCP gives up
+    _z_unicast_transport_close(ztu, _Z_CLOSE_EXPIRED);
+#if Z_FEATURE_AUTO_RECONNECT == 1
+    // Wait for senders that started before _tp_ready was cleared
+    _z_mutex_lock(&session->_mutex_transport);
 #endif
+    // Only this (lease) task is left to detach
+    _z_unicast_transport_clear(ztu, true);
+    // Without this, closing the session would clear the transport a second time
+    session->_tp._type = _Z_TRANSPORT_NONE;
+#if Z_FEATURE_AUTO_RECONNECT == 1
+    _z_mutex_unlock(&session->_mutex_transport);
 
+    z_result_t ret = _z_reopen(&zs);
+    if (ret != _Z_RES_OK) {
+        _Z_INFO("Reconnect stopped: %i", ret);
+    }
+    _z_mutex_lock(&session->_mutex_transport);
+    session->_reconnecting = false;
+    _z_mutex_unlock(&session->_mutex_transport);
+#endif
+    // Last access to the session. If its owner has dropped it meanwhile, this closes it here: the
+    // transport is cleared and no task of it is left, so nothing is joined.
+    _z_session_rc_drop(&zs);
     _z_task_exit();
 }
 

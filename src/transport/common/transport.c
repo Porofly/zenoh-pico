@@ -18,6 +18,7 @@
 #include "zenoh-pico/link/link.h"
 #include "zenoh-pico/system/common/platform.h"
 #include "zenoh-pico/transport/unicast/accept.h"
+#include "zenoh-pico/utils/logging.h"
 #include "zenoh-pico/utils/result.h"
 
 void _z_common_transport_clear(_z_transport_common_t *ztc, bool detach_tasks) {
@@ -27,8 +28,8 @@ void _z_common_transport_clear(_z_transport_common_t *ztc, bool detach_tasks) {
         ztc->_read_task_running = false;
         if (detach_tasks) {
             _z_task_detach(ztc->_read_task);
-        } else {
-            _z_task_join(ztc->_read_task);
+        } else if (_z_task_join(ztc->_read_task) != _Z_RES_OK) {
+            _Z_ERROR("Unable to join the read task");
         }
         _z_task_free(&ztc->_read_task);
         ztc->_read_task = NULL;
@@ -37,8 +38,8 @@ void _z_common_transport_clear(_z_transport_common_t *ztc, bool detach_tasks) {
         ztc->_lease_task_running = false;
         if (detach_tasks) {
             _z_task_detach(ztc->_lease_task);
-        } else {
-            _z_task_join(ztc->_lease_task);
+        } else if (_z_task_join(ztc->_lease_task) != _Z_RES_OK) {
+            _Z_ERROR("Unable to join the lease task");
         }
         _z_task_free(&ztc->_lease_task);
         ztc->_lease_task = NULL;

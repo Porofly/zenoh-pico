@@ -61,6 +61,16 @@ z_result_t _z_session_init(_z_session_t *zn, const _z_id_t *zid) {
     if (ret != _Z_RES_OK) {
         return ret;
     }
+#if Z_FEATURE_AUTO_RECONNECT == 1
+    ret = _z_mutex_init(&zn->_mutex_transport);
+    if (ret != _Z_RES_OK) {
+        _z_mutex_drop(&zn->_mutex_inner);
+        return ret;
+    }
+    zn->_tp_ready = false;
+    zn->_closing = false;
+    zn->_reconnecting = false;
+#endif
     zn->_mutex_inner_initialized = true;
 #endif
     zn->_mode = Z_WHATAMI_CLIENT;
@@ -107,6 +117,9 @@ z_result_t _z_session_init(_z_session_t *zn, const _z_id_t *zid) {
     if (ret != _Z_RES_OK) {
         zn->_mutex_inner_initialized = false;
         _z_mutex_drop(&zn->_mutex_inner);
+#if Z_FEATURE_AUTO_RECONNECT == 1
+        _z_mutex_drop(&zn->_mutex_transport);
+#endif
         _Z_ERROR_RETURN(ret);
     }
 #endif
@@ -120,10 +133,35 @@ z_result_t _z_session_init(_z_session_t *zn, const _z_id_t *zid) {
 }
 
 void _z_session_clear(_z_session_t *zn) {
-    if (!_z_session_is_closed(zn)) {
+    // Clear once: z_close() followed by the last drop calls this twice. The transport may already be
+    // closed (NONE) while a reconnect is in progress, so do not use that to decide.
 #if Z_FEATURE_MULTI_THREAD == 1
-        _zp_stop_read_task(zn);
-        _zp_stop_lease_task(zn);
+    bool first_clear = zn->_mutex_inner_initialized;
+#else
+    bool first_clear = !_z_session_is_closed(zn);
+#endif
+    if (first_clear) {
+#if Z_FEATURE_MULTI_THREAD == 1
+#if Z_FEATURE_AUTO_RECONNECT == 1
+        // Make a lease task that is tearing down or reopening the transport stop, and wait for it:
+        // it owns _tp until it clears _reconnecting
+        _z_mutex_lock(&zn->_mutex_transport);
+        zn->_closing = true;
+        zn->_tp_ready = false;
+        bool reconnecting = zn->_reconnecting;
+        _z_mutex_unlock(&zn->_mutex_transport);
+        while (reconnecting) {
+            z_sleep_ms(10);
+            _z_mutex_lock(&zn->_mutex_transport);
+            reconnecting = zn->_reconnecting;
+            _z_mutex_unlock(&zn->_mutex_transport);
+        }
+#endif
+        // No transport left when a failed reconnect has just given up
+        if (!_z_session_is_closed(zn)) {
+            _zp_stop_read_task(zn);
+            _zp_stop_lease_task(zn);
+        }
 #ifdef Z_FEATURE_UNSTABLE_API
 #if Z_FEATURE_PERIODIC_TASKS == 1
         _zp_stop_periodic_scheduler_task(zn);
@@ -136,8 +174,18 @@ void _z_session_clear(_z_session_t *zn) {
         _z_network_message_slist_free(&zn->_declaration_cache);
 #endif
 
-        _z_close(zn);
-        // Clear Zenoh PID
+#if Z_FEATURE_MULTI_THREAD == 1 && Z_FEATURE_AUTO_RECONNECT == 1
+        // Wait for a sender that passed the ready check before it was cleared. Released before the
+        // transport is cleared: that joins the lease task, which may be waiting for this lock to
+        // see _closing.
+        _z_mutex_lock(&zn->_mutex_transport);
+#endif
+        if (!_z_session_is_closed(zn)) {
+            _z_close(zn);
+        }
+#if Z_FEATURE_MULTI_THREAD == 1 && Z_FEATURE_AUTO_RECONNECT == 1
+        _z_mutex_unlock(&zn->_mutex_transport);
+#endif
         // Clean up transports
         _z_transport_clear(&zn->_tp);
 
@@ -177,6 +225,9 @@ void _z_session_clear(_z_session_t *zn) {
     if (zn->_mutex_inner_initialized) {
         zn->_mutex_inner_initialized = false;
         _z_mutex_drop(&zn->_mutex_inner);
+#if Z_FEATURE_AUTO_RECONNECT == 1
+        _z_mutex_drop(&zn->_mutex_transport);
+#endif
     }
 #endif  // Z_FEATURE_MULTI_THREAD == 1
 }

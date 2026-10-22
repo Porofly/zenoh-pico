@@ -97,6 +97,8 @@ z_result_t _z_unicast_transport_create(_z_transport_t *zt, _z_link_t *zl,
 #endif
         _z_wbuf_clear(&ztu->_common._wbuf);
         _z_zbuf_clear(&ztu->_common._zbuf);
+        // Nothing is left to clear and the caller still owns the link
+        zt->_type = _Z_TRANSPORT_NONE;
     }
     return ret;
 }

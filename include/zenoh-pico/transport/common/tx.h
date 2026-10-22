@@ -39,6 +39,10 @@ z_result_t _z_link_send_t_msg(const _z_link_t *zl, const _z_transport_message_t 
 z_result_t _z_send_n_msg(_z_session_t *zn, const _z_network_message_t *n_msg, z_reliability_t reliability,
                          z_congestion_control_t cong_ctrl, void *peer);
 z_result_t _z_send_n_batch(_z_session_t *zn, z_congestion_control_t cong_ctrl);
+#if Z_FEATURE_MULTI_THREAD == 1 && Z_FEATURE_AUTO_RECONNECT == 1
+// Replay a declaration on a reopened transport that is not ready yet. The caller holds _mutex_transport.
+z_result_t _z_send_n_msg_reopen(_z_session_t *zn, const _z_network_message_t *z_msg);
+#endif
 
 #ifdef __cplusplus
 }
